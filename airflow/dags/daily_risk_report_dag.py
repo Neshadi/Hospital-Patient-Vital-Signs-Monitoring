@@ -11,6 +11,25 @@ Airflow = scheduling/orchestration of periodic reporting & housekeeping.
 
 Schedule: every 5 minutes to match the simulated day (SIMULATED_DAY_SECONDS=300).
 Adjust `schedule_interval` to match whatever simulated-day length you use.
+
+Task flow (check_pipeline_freshness >> compute_and_write_risk_report):
+  1. check_pipeline_freshness -- reads MAX(event_timestamp) from vitals_raw and
+     inserts a 'no_data' warning into pipeline_alerts if the newest reading is
+     more than 2 minutes old. It only raises an alert; it does not stop the DAG.
+  2. compute_and_write_risk_report -- for every patient with a windowed vitals
+     trend, combines:
+       - the latest trend_flag from vitals_windowed_agg
+       - the number of 'patient_critical' alerts in the last simulated day
+       - lab results from the latest simulated day that fall outside their
+         reference_range (lab_results_raw)
+     into a risk score and UPSERTs it into patient_risk_report
+     (key: patient_id + report_day).
+
+Risk score (capped at 100), weights in RISK_WEIGHTS:
+  score = 30 if the vitals trend is 'worsening'
+        + 5  per abnormal-vitals alert in the last simulated day
+        + 15 per abnormal lab result in the latest lab day
+  Level: >= 70 critical, >= 40 high, >= 15 medium, otherwise low.
 """
 from datetime import datetime, timedelta
 
