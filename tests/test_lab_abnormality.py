@@ -2,6 +2,15 @@
 Unit tests for reference-range parsing / abnormality detection logic mirrored
 from airflow/dags/daily_risk_report_dag.py (kept dependency-free here so it
 can run without an Airflow environment installed).
+
+What is covered:
+  - Abnormality check: a lab value is abnormal when it falls outside the
+    "low-high" reference_range string. Tested for in-range, above-range,
+    below-range and exact boundary values (boundaries count as normal).
+  - Risk-level mapping: the score bands used for patient_risk_report
+    (<15 low, 15-39 medium, 40-69 high, >=70 critical).
+
+Not covered: the SQL queries, score weighting and Postgres writes in the DAG.
 """
 
 
