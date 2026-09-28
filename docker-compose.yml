@@ -1,0 +1,142 @@
+# ============================================================
+# Hospital Patient Vital Signs Monitoring - Kappa Architecture
+# ============================================================
+# Single streaming backbone (Kafka) carries BOTH:
+#   1) vitals-stream   -> continuous bedside monitor events
+#   2) lab-results     -> once-per-simulated-day batch drops (treated
+#                         as a low-frequency event stream, per Kappa)
+# Spark Structured Streaming consumes both topics, joins them with
+# a watermark, computes risk scores, and writes to Postgres.
+# ============================================================
+
+services:
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Retention kept generous so the stream can be REPLAYED end-to-end
+      # if processing logic changes - this is what substitutes for
+      # Lambda's batch-layer "recompute from raw" safety net.
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on:
+      - kafka
+    entrypoint: [ "/bin/sh", "-c" ]
+    command: |
+      "
+      cub kafka-ready -b kafka:29092 1 30
+      kafka-topics --create --if-not-exists --topic vitals-stream --bootstrap-server kafka:29092 --partitions 3 --replication-factor 1
+      kafka-topics --create --if-not-exists --topic lab-results --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1
+      kafka-topics --create --if-not-exists --topic pipeline-alerts --bootstrap-server kafka:29092 --partitions 1 --replication-factor 1
+      echo 'Topics created.'
+      "
+
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: hospital
+      POSTGRES_PASSWORD: hospital_pw
+      POSTGRES_DB: hospital_monitoring
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./storage/init:/docker-entrypoint-initdb.d
+      - pg_data:/var/lib/postgresql/data
+
+  vitals-producer:
+    build:
+      context: .
+      dockerfile: docker/producer.Dockerfile
+    command: python data-sources/vitals_stream_producer.py
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      EVENT_INTERVAL_SECONDS: "3"
+
+  lab-results-producer:
+    build:
+      context: .
+      dockerfile: docker/producer.Dockerfile
+    command: python data-sources/lab_results_batch_producer.py
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      # Simulated clock: 1 "day" = 5 minutes (see docs/simulated_clock.md)
+      SIMULATED_DAY_SECONDS: "300"
+
+  spark-processor:
+    build:
+      context: .
+      dockerfile: docker/spark.Dockerfile
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+    restart: unless-stopped
+    environment:
+      KAFKA_BOOTSTRAP: kafka:29092
+      POSTGRES_URL: jdbc:postgresql://postgres:5432/hospital_monitoring
+      POSTGRES_USER: hospital
+      POSTGRES_PASSWORD: hospital_pw
+    volumes:
+      - ./processing:/app/processing
+      - ./observability:/app/observability
+
+  serving-api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    environment:
+      POSTGRES_URL: postgresql://hospital:hospital_pw@postgres:5432/hospital_monitoring
+
+  airflow-webserver:
+    image: apache/airflow:2.9.1
+    depends_on:
+      - postgres
+    ports:
+      - "8081:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://hospital:hospital_pw@postgres:5432/hospital_monitoring
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Defining the connection via env var means it survives `docker compose
+      # down -v` (which wipes the Postgres-backed Airflow metastore) without
+      # needing to be re-added through the UI every time.
+      AIRFLOW_CONN_HOSPITAL_POSTGRES: postgres://hospital:hospital_pw@postgres:5432/hospital_monitoring
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+    command: standalone
+
+volumes:
+  pg_data:
