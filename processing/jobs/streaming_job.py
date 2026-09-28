@@ -5,12 +5,28 @@ Consumes TWO Kafka topics with the SAME Structured Streaming engine:
   - vitals-stream : high-frequency bedside monitor events
   - lab-results   : low-frequency ("daily") pathology results
 
-Pipeline stages:
-  1. Parse + clean both streams (schema enforcement, null/garbage filtering)
+Pipeline stages (three independent streaming queries run side by side):
+  1. Parse + clean both streams
+       - from_json with an explicit schema (VITALS_SCHEMA / LAB_SCHEMA)
+       - vitals get an event_time column and a 2-minute watermark for late data
+       - implausible sensor readings (HR outside 20-250, SpO2 outside 50-100)
+         are dropped before alerting
   2. Windowed aggregation of vitals per patient (trend detection)
-  3. Persist processed vitals and lab results to PostgreSQL
-  4. Threshold alerting
+       - 1-minute tumbling window per patient: avg HR / SpO2 / systolic BP,
+         max temperature, spike count
+       - trend_flag = 'worsening' if the window contains any simulated spike,
+         otherwise 'stable'
+       - UPSERTed into vitals_windowed_agg every 30 s (key: patient_id + window_start)
+  3. Persist to PostgreSQL (10 s micro-batches via foreachBatch + JDBC append)
+       - vitals-stream -> vitals_raw
+       - lab-results   -> lab_results_raw
+  4. Threshold alerting (per vitals micro-batch)
+       - HR > HR_HIGH or < HR_LOW, SpO2 < SPO2_LOW, systolic BP > SBP_HIGH,
+         temperature > TEMP_HIGH -> 'patient_critical' row in pipeline_alerts
+       - a failed micro-batch writes an 'error_rate' alert instead of crashing
   5. Health metrics
+       - one heartbeat row per vitals micro-batch in pipeline_health
+         (events processed, last event time)
 
 Run (inside the spark-processor container):
     spark-submit --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1,\
