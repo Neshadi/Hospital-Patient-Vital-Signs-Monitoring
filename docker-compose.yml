@@ -9,6 +9,7 @@
 # a watermark, computes risk scores, and writes to Postgres.
 # ============================================================
 
+name: hospital-vitals-pipeline
 services:
 
   zookeeper:
